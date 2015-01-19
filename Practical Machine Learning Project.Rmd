@@ -1,0 +1,111 @@
+---
+output: html_document
+---
+### Predicting Quality of Weightlifting Exercises
+
+A dataset was obtained that consists of readings from a set of young male subjects fitted with personal accelerometers while performing a weightlifting exercise in five distinct manners, one of which is correct and the others incorrect. This [data]( from http://groupware.les.inf.puc-rio.br/har) is described in the paper [Velloso, E. *et al.*, Qualitative Activity Recognition of Weight Lifting Exercises. *Proc. of 4th Int. Conf. in Cooperation with SIGCHI*, Stuttgart, Germany: ACM SIGCHI (2013).](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf)
+
+In the present project, the data set is cleaned to select variables that are informative for model building, and further refined for a chosen set of predictive features. We build a Random Forest model to predict from a new set of readings whether the exercise has been performed correctly, or if not, which of the identified mistakes is implicated. This model is is evaluated in the first instance on a reserved set of cross-validation data for an out-of-sample estimate of classification error, and then is applied to a testing set for assessment on unknown classifications.
+
+#### Getting and tidying the data  
+
+The data, already  partitioned into training and testing sets, was retrieved from the web, and cached in local files. 
+```{r}
+trainFile<-"pml-training.csv"; testFile<-"pml-testing.csv"
+if (!file.exists (trainFile))
+    download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", trainFile)
+if ( !file.exists (testFile) ) 
+    download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", testFile)
+training <-read.csv(trainFile);testing <-read.csv(testFile)
+```
+
+There is no code book apparently available for these tables. However, inspection using `str()`, and comparison with the general description in the publication shows that each data frame consists of these categories of variables:
+
+1. IDs (`X` and `user_name`, cols 1-2)
+2. logistics (timestamps and observation windows, cols 3-7)
+3. accelerometer readings, numeric/integer in principle but with many missing values shown variously as blank/NA/"DIV/0!" (cols 8-159)
+4. The measured quality class `classe` with values A/B/C/D/E in the case of the training set, and NULL in the case of the test set (with values to be predicted by our model)
+
+For our model, we want to retain only (3) and (4) above. We also want to drop the columns that have mostly missing or invariant data in them.
+
+```{r, collapse=TRUE, warning=FALSE, message=FALSE}
+library(caret)
+set.seed(123)
+training <- training[, 8:160]; testing <- testing[ , 8:159]
+nsv<-nearZeroVar(training, freqCut=90/10)
+training <- training[, -nsv]; testing <- testing[, -nsv]
+```
+
+Applying `nearZeroVar` (based on the contents of training data) not only dropped the uninformative columns, but has also cleared out some of the junk entries and mis-typed variables. . However, review shows that several columns are mostly (> 95%) NAs, and so still unsuitable for prediction, so these are removed, too, leading to a clean dataset with 52 continuous(numeric/integer) dependent variables, plus the outcome `classe`as a factor in the training data.
+
+```{r}
+junk <- which(colMeans(is.na(training)) > .95)
+training <- training[ , -junk]; testing <- testing[ , -junk]
+cat("Training is a", class(training), "of", dim(training)[1], "observations of",  dim(training)[2], "variables.")
+cat("Number of missing values remaining = ", sum(sum(is.na(training)))+sum(sum(is.na(testing))) )
+```
+
+#### Feature selection for prediction
+
+After cleaning, we have 52 candidate features, but we are concerned about potential overfitting, and also performance of constructing and applying a model. (The original paper uses 17 features.) To explore this, we calculate and visualize pairwise correlations of the covariates, and find several are strong (absolute value >0.8). We exclude the half of the pair with the largest mean absolute correlation.
+
+
+```{r, , warning=FALSE, message=FALSE,fig.width=8, fig.height=5}
+library(corrplot)
+M <- cor(training[ , 1:52])
+corrplot(M, method="color", tl.cex=0.7, tl.col="black", order="hclust")
+hc <- findCorrelation(M, 0.8)
+training <- training[ , -hc]; testing <- testing[ , -hc]
+```
+
+#### Creating a model
+
+Having now a compact, manageable and hopefully informative set of 31 features, we are in a position to prepare for developing a predictive model. We need to do some exploration and choose a method and some parameters. 
+
+[Random Forests](https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm) ("RFs") appear to be a good approach to start with. RFs are generally accurate, reasonably efficient, robust to overfitting (given we may still have more predictors than we need), and generate useful diagnostics including estimates of error rates and importance of predictors. One potential vulnerability, namely a tendency to bias with classification variables, does not apply here since the only such variable is the outcome `classe` and that is roughly balanced. RFs are conveniently available in R through the `caret` library. Moreover, an RF was used in the original HAR analysis.
+
+We start by setting aside a random portion of the training data for later cross-validation. Then we build an RF on the remaining training data using the [caret package's implementation of RFs](http://topepo.github.io/caret/training.html), which automatically explores the sensitive mtry parameter and applies multiple k-fold resampling. We also retain and plot the variable importance, which gives us an idea of the dominant predictors, in case we want to return to feature selection, perhaps to reduce variance (although RFs are relatively robust to this).
+
+The result is an RF that has an OOB error estimate (based on the training data, but using "out-of-bag" variables and so unbiased) that is promisingly low, so we adopt this RF  as our predictive model, pending final validation.
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(123)
+inTrain <- createDataPartition(y=training$classe,
+                              p=.8, list=FALSE)
+trainData <- training[inTrain,]
+cvData <- training[-inTrain,]
+tc <- trainControl(method = "cv", number = 5)
+rf <- train(classe ~., data=trainData, method="rf", trControl = tc, tuneLength=5, proximity=FALSE, importance=TRUE)
+plot(varImp(rf, type=2))
+cat ("Final out-of-bag error estimate =", 
+     round(tail(rf$finalModel$err.rate[,"OOB"], n=1),4))
+```
+
+#### Out-of-sample error estimate
+
+We next validate the model using the reserved data for an estimate of fully out-of-sample misclassification error rate, and compare it to that of the model's training data. On this data, the cross-validation error rate is  slightly lower still than the OOB estimate.
+
+```{r, warning=FALSE, message=FALSE}
+missClass = function(values,prediction) 
+    sum((prediction != values)/length(values))
+cat("Cross-validation misclassification rate: ",
+    round(missClass(cvData$classe, predict(rf, cvData)),4))
+cat("Training misclassification rate: ",
+    round(missClass(trainData$classe, predict(rf,trainData)),4))
+```
+
+#### Assessment on testing data
+
+Returning to the original testing data, for which we have no `classe` assignments, we now can predict these with the model. We also write them into uploadable files for assessment purposes.
+
+```{r, warning=FALSE, message=FALSE}
+print(answers <- as.character(predict(rf,testing)))
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(answers)
+```
